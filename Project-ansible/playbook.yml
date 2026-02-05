@@ -1,0 +1,179 @@
+---
+# ============================================================================
+# Playbook: PostgreSQL Day 2 Operations
+# Description: PostgreSQL service status verification, automated backup/restores ,read-only user creation/management, granting access to the database 
+# Author: Ubiratan Fernando Prestes
+# Version: 1.0
+# Last Updated: 2026-02-05
+# ============================================================================
+#
+# Requirements:
+#   - Ansible 2.9+
+#   - PostgreSQL 12+
+#   - community.postgresql collection
+#
+# Usage:
+#   ansible-playbook postgres-day2-ops.yml --ask-vault-password
+#
+# Usage 2: Restoring PostgreSQL Database from backup (conditional)
+# Warning: This restoration method is destructive. It deletes the entire database, recreates it from scratch, and then restores the data from the backup file.
+#   ansible-playbook postgres-day2-ops.yml --ask-vault-password -e "restore_backup=true"
+#
+# Variables:
+#   See vars/secrets.yml for sensitive credentials (encrypted)
+# ============================================================================
+
+- name: PostgreSQL Day 2 Operations
+  hosts: postgres
+  become: true
+  vars_files:
+    - vars/secrets.yml          #  file encrypted with readonly_user and readonly_password 
+  vars:
+    postgres_service: postgresql
+    postgres_backup_dir: /var/backups/postgresql
+    postgres_db: payments
+    postgres_backup_file: "{{ postgres_backup_dir }}/{{ postgres_db }}_{{ ansible_date_time.date }}.sql"
+
+  tasks:
+ 
+# ========================================
+# Checking if the backup directory exists in the specified path
+# ========================================
+
+    - name: Ensure backup directory exists
+      file:
+        path: "{{ postgres_backup_dir }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0750'
+
+# ========================================
+# Cheking PostgreSQL services status
+# ========================================
+
+    - name: Check PostgreSQL service status
+      service_facts:
+
+    - name: Display PostgreSQL service status
+      debug:
+        msg: "PostgreSQL service state: {{ ansible_facts.services[postgres_service].state }}"
+      when: postgres_service in ansible_facts.services
+
+    - name: Start PostgreSQL if it is not running
+      service:
+        name: "{{ postgres_service }}"
+        state: started
+      when:
+        - postgres_service in ansible_facts.services
+        - ansible_facts.services[postgres_service].state != "running"
+
+# ========================================
+# Database Backup Task
+# ========================================
+
+    - name: Perform PostgreSQL logical backup
+      become_user: postgres
+      command: pg_dump -Fc {{ postgres_db }} -f {{ postgres_backup_file }}
+      args:
+        creates: "{{ postgres_backup_file }}"
+
+# ========================================
+# User creation Task
+# ========================================
+
+    - name: Creating a read-only user to access the database
+      become_user: postgres
+      postgresql_user:
+        name: "{{ readonly_user }}"          # get credentials from vars/secrets.yml
+        password: "{{ readonly_password }}"  # get credentials from vars/secrets.yml
+        state: present
+
+# ========================================
+# Tasks granting read-only access to databases and tables
+# ========================================
+
+    - name: Grant CONNECT privilege on database
+      become_user: postgres
+      postgresql_privs:
+        database: "{{ postgres_db }}"
+        roles: "{{ readonly_user }}"
+        privs: CONNECT
+        type: database
+
+    - name: Grant USAGE privilege on schema
+      become_user: postgres
+      postgresql_privs:
+        database: "{{ postgres_db }}"
+        roles: "{{ readonly_user }}"
+        privs: USAGE
+        type: schema
+        objs: public
+
+    - name: Grant SELECT privilege on all tables
+      become_user: postgres
+      postgresql_privs:
+        database: "{{ postgres_db }}"
+        roles: "{{ readonly_user }}"
+        privs: SELECT
+        type: table
+        objs: ALL_IN_SCHEMA
+        schema: public   
+
+# ========================================
+# Database Restore Task (conditional)
+# Warning: This restoration method is destructive. It deletes the entire database, recreates it from scratch, and then restores the data from the backup file.
+# ========================================
+
+    - name: Check if restore is requested
+      set_fact:
+        perform_restore: "{{ restore_backup | default(false) }}"
+
+    - name: Stop PostgreSQL before restore
+      service:
+        name: "{{ postgres_service }}"
+        state: stopped
+      when: perform_restore | bool
+
+    - name: Drop existing database (WARNING: destructive)
+      become_user: postgres
+      postgresql_db:
+        name: "{{ postgres_db }}"
+        state: absent
+      when: perform_restore | bool
+
+    - name: Recreate database
+      become_user: postgres
+      postgresql_db:
+        name: "{{ postgres_db }}"
+        state: present
+        encoding: UTF8
+      when: perform_restore | bool
+
+    - name: Restore PostgreSQL backup
+      become_user: postgres
+      command: pg_restore -d {{ postgres_db }} {{ postgres_backup_file }}
+      when: perform_restore | bool
+
+    - name: Start PostgreSQL after restore
+      service:
+        name: "{{ postgres_service }}"
+        state: started
+      when: perform_restore | bool
+
+# ========================================
+# Final Status Report
+# ========================================
+
+    - name: Display operation summary
+      debug:
+        msg:
+          - "============================================"
+          - "PostgreSQL Day 2 Operations - Summary"
+          - "============================================"
+          - "Service Status: {{ ansible_facts.services[postgres_service].state }}"
+          - "Database: {{ postgres_db }}"
+          - "Backup Location: {{ postgres_backup_file }}"
+          - "Read-Only User: {{ readonly_user }}"
+          - "Restore Performed: {{ restore_backup }}"
+          - "============================================"
